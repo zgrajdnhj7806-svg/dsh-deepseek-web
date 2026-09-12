@@ -1,0 +1,5 @@
+# dsh-deepseek-web bundle patch：把插件挂进 profile 的层栈。
+# id 是 loader 行的可寻址键（profile 的 cordis.patch.yml 可按同一 id 覆盖 config）。
+- insert:
+    - id: deepseek-web
+      name: 'dsh-deepseek-web'
