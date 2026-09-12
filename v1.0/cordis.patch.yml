@@ -1,0 +1,21 @@
+# MCP 形态的 deepseek-web：注册示例
+# 用法：把下面这段合并进 <DSH_HOME>/profiles/web/cordis.patch.yml 的顶层数组，
+#       再把 <本目录> 换成插件目录的绝对路径（例如 C:/Users/you/.dsh/mcp-servers/deepseek-web）。
+# 依赖：Node >= 18，先在插件目录执行 npm install 装好 @modelcontextprotocol/sdk。
+- insert:
+    - id: mcp-deepseek-web
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        serverName: deepseek-web
+        command: node
+        args:
+          - '<本目录>/src/index.mjs'
+        env:
+          # 必填：chat.deepseek.com 网页端登录凭据（浏览器 F12 里复制 userToken 与 Cookie）
+          DEEPSEEK_WEB_TOKEN: '<网页端 userToken>'
+          DEEPSEEK_WEB_COOKIE: '<网页端 cookie>'
+          # 可选：fs_list / fs_read / fs_grep 允许访问的根目录，默认用户主目录
+          # DWH_ROOT: '<项目根绝对路径>'
+          # 可选：凭据兜底文件，默认取本包根目录的 credentials.json
+          # DEEPSEEK_WEB_CREDENTIALS: '<credentials.json 绝对路径>'
