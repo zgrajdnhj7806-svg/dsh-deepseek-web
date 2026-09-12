@@ -8,9 +8,10 @@
  * 完全在 DSH / Node 运行时内运行：PoW 用官方 sha3_wasm_bg.wasm（Node 的 WebAssembly 直接跑，
  * 不需要 wasmtime / Python），对话走 Node 原生 fetch + SSE 解析。不依赖任何外部进程或 HTTP 代理。
  *
- * 登录（DeepSeek 账号）凭据来源（按优先级）：
- *   1) 环境变量 DEEPSEEK_WEB_TOKEN / DEEPSEEK_WEB_COOKIE
- *   2) DEEPSEEK_WEB_CREDENTIALS 指向的 JSON 文件，或本包根目录的 credentials.json
+ * 登录（DeepSeek 账号）优先级：
+ *   1) 环境变量 DEEPSEEK_WEB_TOKEN / DEEPSEEK_WEB_COOKIE（推荐，可由 profiles/web/cordis.patch.yml 注入）
+ *   2) DEEPSEEK_WEB_CREDENTIALS 指向的 JSON 文件（内含 token 与 cookie 两个字段）
+ *   3) 本包根目录的 credentials.json
  *
  * 注册方式（profiles/web/cordis.patch.yml）：
  *   - id: mcp-deepseek-web
@@ -33,7 +34,7 @@
  *   - critique_workspace 一键有证据的挑刺：自动 fs_grep→读证据→网页端 critique（手动三步的封装）
  *   - web_conversation_list  列出活跃对话（对话ID/模型/更新时间/预览）
  *   - web_conversation_clear  删除对话（单条 by conversation_id，或 all:true 清空）
- *   所有 fs_* 工具限定在 ROOT（env DWH_ROOT 或用户主目录）内，防越界。
+ *   所有 fs_* 工具限定在允许根目录内（env DWH_ROOTS 可配多个，逗号/分号分隔；否则 DWH_ROOT；再否则用户主目录），防越界。
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -44,7 +45,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, copyFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { dirname, join, resolve, relative, basename } from "node:path";
+import { dirname, join, resolve, relative, basename, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
 
@@ -595,22 +596,51 @@ function readRange(file, startLine, endLine) {
 }
 
 // —— 工作目录访问（技能「挑刺」机制：模型可探查项目、读文件、搜符号，把真实证据交给网页端）——
-// 允许访问的根目录：env DWH_ROOT 或默认用户主目录。所有路径必须落在该根内（防越界）。
-const ROOT = (process.env.DWH_ROOT && process.env.DWH_ROOT.trim()) || os.homedir();
+// 允许访问的根目录（多根）：
+//   env DWH_ROOTS（逗号/分号分隔，可配多个，例如同时覆盖 home 与模组目录）优先；
+//   否则 env DWH_ROOT；再否则默认用户主目录。所有路径必须落在某个允许根内（防越界）。
+function parseRoots() {
+  const out = [];
+  const push = (v) => { const t = (v || "").trim(); if (t) out.push(resolve(t)); };
+  if (process.env.DWH_ROOTS) for (const part of process.env.DWH_ROOTS.split(/[;,]/)) push(part);
+  push(process.env.DWH_ROOT);
+  if (!out.length) out.push(os.homedir());
+  // 去重 + 长的优先（更具体的根先匹配，避免被父根误吞）
+  const seen = new Set();
+  return out.filter((r) => (seen.has(r) ? false : (seen.add(r), true))).sort((a, b) => b.length - a.length);
+}
+const ROOTS = parseRoots();
+const ROOT = ROOTS[0]; // 主根（用于描述/默认列根）
+
+// 递归搜索时跳过的目录 / 超大文件跳过阈值（多根改造时曾被误删，需保留）
 const SKIP_DIRS = new Set(["node_modules", ".git", ".workbuddy", "dist", "build", ".cache", "node_modules/.cache"]);
 const MAX_FILE_BYTES = 2_000_000;
 
+function withinRoot(abs, r) {
+  const rel = relative(r, abs);
+  return rel === "" || (!rel.startsWith("..") && (abs === r || abs.startsWith(r + sep)));
+}
+
+// 解析 p（相对某根，或绝对路径），返回 {abs, root}；不在任何允许根内则抛错（防越界）。
+// 相对路径依次锚定到每个 ROOT 解析：①优先返回「真实存在」的那个根（消除多根歧义：WorkBuddy/... 只存在于 home 根，
+// 尽管词法上也能拼到 addons 根下）；②若都不存在但词法落在某根内，返回第一个（让下游 statSync 自然报 ENOENT）。
 function resolveSafe(p) {
-  const abs = resolve(ROOT, p || "");
-  const rel = relative(ROOT, abs);
-  if (rel.startsWith("..") || rel === "..") {
-    throw new Error("路径越界（超出允许根目录 " + ROOT + "）：" + p);
+  const raw = (p && String(p).trim()) ? String(p).trim() : "";
+  if (!raw) return { abs: ROOT, root: ROOT };
+  let lexical = null;
+  for (const r of ROOTS) {
+    const abs = resolve(r, raw);
+    if (withinRoot(abs, r)) {
+      if (!lexical) lexical = { abs, root: r };
+      if (existsSync(abs)) return { abs, root: r };
+    }
   }
-  return abs;
+  if (lexical) return lexical;
+  throw new Error("路径越界（不在任何允许根目录内：" + ROOTS.join(" | ") + "）：" + p);
 }
 
 function listDir(relPath) {
-  const abs = resolveSafe(relPath || "");
+  const { abs, root } = resolveSafe(relPath || "");
   const st = statSync(abs);
   if (!st.isDirectory()) throw new Error("不是目录：" + relPath);
   const names = readdirSync(abs).sort((a, b) => a.localeCompare(b));
@@ -626,11 +656,11 @@ function listDir(relPath) {
     }
     entries.push({ name, type: isDir ? "dir" : "file", size: info.size, lines });
   }
-  return { path: abs, root: ROOT, entries };
+  return { path: abs, root, entries };
 }
 
 function readAny(relPath, startLine, endLine) {
-  const abs = resolveSafe(relPath);
+  const { abs } = resolveSafe(relPath);
   const text = readFileSync(abs, "utf-8");
   const lines = text.split("\n");
   if (startLine == null) {
@@ -644,7 +674,7 @@ function readAny(relPath, startLine, endLine) {
 function grepProject(pattern, relPath, glob, maxResults) {
   const re = new RegExp(pattern, "i");
   const globRe = glob ? new RegExp("^" + String(glob).replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$", "i") : null;
-  const base = resolveSafe(relPath || "");
+  const { abs: base, root } = resolveSafe(relPath || "");
   const cap = Math.max(1, Math.min(maxResults || 60, 300));
   const results = [];
   const walk = (dir) => {
@@ -668,14 +698,14 @@ function grepProject(pattern, relPath, glob, maxResults) {
         for (let i = 0; i < lines.length; i++) {
           if (results.length >= cap) break;
           if (re.test(lines[i])) {
-            results.push({ file: relative(ROOT, full), line: i + 1, text: lines[i].trim().slice(0, 400) });
+            results.push({ file: relative(root, full), line: i + 1, text: lines[i].trim().slice(0, 400) });
           }
         }
       }
     }
   };
   walk(base);
-  return { pattern, root: ROOT, count: results.length, results };
+  return { pattern, root, count: results.length, results };
 }
 
 async function main() {
@@ -710,7 +740,7 @@ async function main() {
           if (!existsSync(a.target_file)) {
             if (!create) throw new Error("target_file 不存在：" + a.target_file + "（若要新建文件，请加 target_create:true）");
             // 新建文件：整文件内容即代码块
-            const abs = resolveSafe(a.target_file);
+            const { abs } = resolveSafe(a.target_file);
             mkdirSync(dirname(abs), { recursive: true });
             writeFileSync(abs, codeToWrite, "utf-8");
             return {
@@ -758,13 +788,14 @@ async function main() {
           };
         }
 
-        let code, srcLabel, actuallyEnd = 0, total = 0;
-        if (a.code != null && String(a.code).trim() !== "") {
+        let code, srcLabel, actuallyEnd = 0, total = 0, contentFromQuestion = false;
+        const codeStr = (a.code != null) ? String(a.code) : "";
+        const fileStr = (a.file != null) ? String(a.file) : "";
+        if (codeStr.trim() !== "") {
           // 调用方直接喂内容（代码需求 / 伪代码 / 网络搜寻结果 / 粘贴片段等）
-          code = String(a.code);
+          code = codeStr;
           srcLabel = "来源：调用方直接提供的内容（code 参数）";
-        } else {
-          if (!a.file) throw new Error("缺少 file 或 code 参数（二者至少给一个；给了 code 则忽略 file）");
+        } else if (fileStr.trim() !== "") {
           const s = parseInt(a.start_line, 10);
           const e = parseInt(a.end_line, 10);
           if (!(s >= 1) || !(e >= s)) throw new Error("start_line / end_line 非法（需 1-based 且 end>=start）");
@@ -772,11 +803,18 @@ async function main() {
           code = r.code; actuallyEnd = r.actuallyEnd; total = r.total;
           if (!code.trim()) throw new Error("指定行范围为空（文件共 " + total + " 行）");
           srcLabel = "文件：" + a.file + "\n行范围：第 " + s + "–" + actuallyEnd + " 行（共 " + total + " 行）";
+        } else if (a.question && String(a.question).trim() !== "") {
+          // 兜底：调用方把待分析内容误放进 question（而非 code）→ 当作内容，不再硬报错
+          code = String(a.question).trim();
+          contentFromQuestion = true;
+          srcLabel = "来源：question 参数（未给 code/file，已把 question 当作分析内容；建议改用 code 参数传入内容、question 仅放具体问题）";
+        } else {
+          throw new Error("缺少分析内容：请通过 code 参数传入待分析文本，或用 file 指定文件+行范围；也可把内容放 question（会当作内容）。三者至少给一个。");
         }
         const q = (a.question && String(a.question).trim()) || "";
         const mode = (a.mode && ["summary", "analyze", "explain", "implement", "critique"].includes(a.mode)) ? a.mode : "summary";
         let instruction;
-        if (q) {
+        if (q && !contentFromQuestion) {
           instruction = q;
         } else if (mode === "analyze") {
           instruction = "请对这段代码做深度解析：指出它的职责、潜在问题（含空指针/越界/竞态/边界）、边界情况与可改进点，并给出具体修改建议。";
@@ -856,7 +894,7 @@ async function main() {
         out += "\n\n— — —\n对话ID（继续追问请原样回传此 ID；开新话题则省略或传 restart:true）：" + conv.id;
         if (a.save_result && String(a.save_result).trim()) {
           try {
-            const sp = resolveSafe(String(a.save_result).trim());
+            const { abs: sp } = resolveSafe(String(a.save_result).trim());
             writeFileSync(sp, "# DeepSeek 网页端分析存档\n\n" + out + "\n", "utf-8");
             out = "（已存至 " + sp + "）\n\n" + out;
           } catch (e) {
