@@ -69,6 +69,73 @@ dsh plugin --profile web add github:zgrajdnhj7806-svg/dsh-deepseek-web
 # 编辑 ~/.dsh/profiles/web/package.json：在 dsh.profile.bundles 数组里追加 "dsh-deepseek-web"
 ```
 
+## 另一个形态：`v1.0/`（MCP 服务版）
+
+`v1.0/` 是同一套网页端协议的另一份**独立实现**：一个纯 stdio 的 MCP 服务器，不依赖 dsh 的插件体系，
+任何支持 MCP 的客户端都能接入；只想把它当「网页端模型代理」用时选这个。
+
+**环境要求**：Node.js **>= 18**（PoW 用 Node 内置 WebAssembly 直跑官方 `sha3_wasm_bg.wasm`，依旧零 Python / 零代理）
+
+```bash
+cd v1.0
+npm install        # 只装 @modelcontextprotocol/sdk
+```
+
+> 请**保留仓库目录结构**：`v1.0/src/pow.mjs` 在本目录找不到 wasm 时会向上找 `assets/sha3_wasm_bg.wasm[.b64]`。
+> 只把 `v1.0/` 单独拷走的话，要么连 `assets/` 一起拷，要么把 `sha3_wasm_bg.wasm`（或 `.wasm.b64`）放进 `v1.0/src/`。
+
+**注册**：把 [v1.0/cordis.patch.yml](v1.0/cordis.patch.yml) 里的 `- insert:` 段合并进
+`<DSH_HOME>/profiles/web/cordis.patch.yml` 的顶层数组，并把 `args` 里的 `<本目录>` 换成 `v1.0/` 的绝对路径：
+
+```yaml
+- insert:
+    - id: mcp-deepseek-web
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        serverName: deepseek-web
+        command: node
+        args:
+          - '<v1.0 绝对路径>/src/index.mjs'
+        env:
+          DEEPSEEK_WEB_TOKEN: '<网页端 userToken>'
+          DEEPSEEK_WEB_COOKIE: '<网页端 cookie>'
+          # DWH_ROOT: '<项目根绝对路径>'
+          # DEEPSEEK_WEB_CREDENTIALS: '<credentials.json 绝对路径>'
+```
+
+**环境变量（`env` 段）**
+
+| 变量 | 必填 | 说明 |
+|---|---|---|
+| `DEEPSEEK_WEB_TOKEN` | 是* | 网页端 userToken（F12 → `/api/v0/chat/completion` → `Authorization: Bearer` 后面的值） |
+| `DEEPSEEK_WEB_COOKIE` | 否 | 同一次请求的 `Cookie` |
+| `DEEPSEEK_WEB_CREDENTIALS` | 否 | 指向 `{ "token": …, "cookie": … }` 的 JSON 文件 |
+| `DWH_ROOTS` | 否 | `fs_*` 工具的允许根目录，逗号 / 分号分隔可配多个 |
+| `DWH_ROOT` | 否 | 单个默认根目录；与 `DWH_ROOTS` 都没有时用用户主目录 |
+
+> *凭据取用优先级：`DEEPSEEK_WEB_TOKEN` 环境变量 → `DEEPSEEK_WEB_CREDENTIALS` 指向的文件 → `v1.0/credentials.json`。
+
+**自带 7 个工具**
+
+| 工具 | 说明 |
+|---|---|
+| `web_analyze_range` | 把内容交给网页端模型分析：给 `file` + `start_line`/`end_line` 读文件区间，或直接给 `code`；支持 `summary`/`analyze`/`explain`/`critique`/`implement`、多轮 `conversation_id`、`search=true` 联网、`save_result` 存档 |
+| `critique_workspace` | 对工作区做对抗式审查（挑刺 / 找漏洞） |
+| `fs_list` | 列目录（限定在允许根内，防越界） |
+| `fs_read` | 读文件（同上） |
+| `fs_grep` | 内容检索（同上） |
+| `web_conversation_list` | 列出当前会话池里的网页端对话 |
+| `web_conversation_clear` | 按 `conversation_id` 删单条，或 `all=true` 清空会话池 |
+
+**直接跑（调试用）**
+
+```bash
+node v1.0/src/index.mjs        # 按 MCP stdio 协议收发，ready 行打到 stderr
+```
+
+> 「⚠️ 账号安全」对 `v1.0/` 同样适用：**单线程、全串行，不要并发调用，不要高频轰炸**。
+
 ## 登录（三条路，从省事到兜底）
 
 1. **一键登录（打开 Edge）** —— 设置页按钮。插件拉起本机 Edge（独立 profile，存在 `$DSH_HOME/cache/dsh-deepseek-web/browser_profile`），你在窗口里登录一次，插件用 CDP 读 `localStorage.userToken` 与 cookie 并保存，之后长期免登录。
@@ -124,7 +191,8 @@ dsh-deepseek-web/
 ├── assets/skill/SKILL.md         技能正文
 ├── bin/dsweb.mjs                 独立 CLI（--check / --prompt / --file --lines）
 ├── cordis.patch.yml              bundle patch 行
-└── scripts/                      install.sh / install.ps1 一键安装
+├── scripts/                      install.sh / install.ps1 一键安装
+└── v1.0/                         独立的 MCP 服务版（package.json + src/index.mjs + src/pow.mjs + cordis.patch.yml）
 ```
 
 ## 已知限制
