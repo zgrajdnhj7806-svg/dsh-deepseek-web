@@ -1,0 +1,303 @@
+#!/usr/bin/env node
+/**
+ * deepseek-web-mcp · DSH 插件（模型技能）· 纯 Node 实现
+ *
+ * 把 DeepSeek 网页端直接包装成 DSH 可调用的 MCP 工具，模型可用它分析任意代码
+ * 文件指定行范围（第 start_line 至 end_line 行），内容经网页端 DeepSeek 返回分析。
+ *
+ * 完全在 DSH / Node 运行时内运行：PoW 用官方 sha3_wasm_bg.wasm（Node 的 WebAssembly 直接跑，
+ * 不需要 wasmtime / Python），对话走 Node 原生 fetch + SSE 解析。不依赖任何外部进程或 HTTP 代理。
+ *
+ * 登录（DeepSeek 账号）凭据来自环境变量：
+ *   DEEPSEEK_WEB_TOKEN / DEEPSEEK_WEB_COOKIE
+ *   （由 profiles/web/cordis.patch.yml 的本插件 env 注入；详见本包 cordis.patch.yml）
+ *
+ * 注册方式（<DSH_HOME>/profiles/web/cordis.patch.yml）：
+ *   - id: mcp-deepseek-web
+ *     name: '@deepseek-ai/dsh-mcp-client'
+ *     config:
+ *       transport: stdio
+ *       serverName: deepseek-web
+ *       command: node
+ *       args: ['<本插件目录>/src/index.mjs']
+ *       env:
+ *         DEEPSEEK_WEB_TOKEN: '<网页端 userToken>'
+ *         DEEPSEEK_WEB_COOKIE: '<网页端 cookie>'
+ *
+ * 暴露工具（名称稳定）：
+ *   - web_analyze_range  读取文件行范围/直接喂内容，提交网页端做分析/总结/解释/挑刺(critique)/补全实现(implement)
+ *                         增强：search(联网搜索) / save_result(存档markdown) / apply 支持 target_create(新建) + backup(写前备份)
+ *   - fs_list            列出工作目录结构（挑刺机制第一步：先知道项目全貌）
+ *   - fs_read            读取项目内任意文件/行范围（把真实代码读出来当证据）
+ *   - fs_grep            递归搜索符号（确认某符号是否真有消费者/被修改/衰减，消除跨文件假阳性）
+ *   - critique_workspace 一键有证据的挑刺：自动 fs_grep→读证据→网页端 critique（手动三步的封装）
+ *   - web_conversation_list  列出活跃对话（对话ID/模型/更新时间/预览）
+ *   - web_conversation_clear  删除对话（单条 by conversation_id，或 all:true 清空）
+ *   所有 fs_* 工具限定在 ROOT（env DWH_ROOT 或用户主目录）内，防越界。
+ */
+
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, copyFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { dirname, join, resolve, relative, basename } from "node:path";
+import { fileURLToPath } from "node:url";
+import os from "node:os";
+
+import { makePowHeader } from "./pow.mjs";
+
+// ---------- 多轮对话会话存储（内存 + 本地 JSON 持久化，跨 DSH 重启可续） ----------
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const CONV_FILE = join(__dirname, "conversations.json");
+const MAX_CONV = 100;
+let conversations = new Map();
+
+function loadConversations() {
+  try {
+    if (!existsSync(CONV_FILE)) return;
+    const arr = JSON.parse(readFileSync(CONV_FILE, "utf-8"));
+    if (Array.isArray(arr)) for (const c of arr) if (c && c.id) conversations.set(c.id, c);
+  } catch {}
+}
+function saveConversations() {
+  try {
+    let arr = [...conversations.values()];
+    if (arr.length > MAX_CONV) {
+      arr = arr.sort((a, b) => (b.updated || 0) - (a.updated || 0)).slice(0, MAX_CONV);
+      conversations = new Map(arr.map((c) => [c.id, c]));
+    }
+    writeFileSync(CONV_FILE, JSON.stringify(arr), "utf-8");
+  } catch {}
+}
+loadConversations();
+
+const SERVER_NAME = "deepseek-web";
+const SERVER_VERSION = "1.0.0";
+
+const BASE = "https://chat.deepseek.com";
+const API = BASE + "/api/v0";
+
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0";
+
+const STATIC_HEADERS = {
+  accept: "*/*",
+  "accept-language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+  "content-type": "application/json",
+  origin: BASE,
+  referer: BASE + "/",
+  "user-agent": UA,
+  "x-client-bundle-id": "com.deepseek.chat",
+  "x-client-locale": "zh_CN",
+  "x-client-platform": "web",
+  "x-client-timezone-offset": "28800",
+  "x-client-version": "2.3.0",
+};
+
+// ---------- 凭据解析 ----------
+// 兜底顺序：环境变量 → $DEEPSEEK_WEB_CREDENTIALS 指定的文件 → 本包根目录的 credentials.json
+const CRED_FILE = (process.env.DEEPSEEK_WEB_CREDENTIALS || "").trim()
+  || join(__dirname, "..", "credentials.json");
+
+function getTokenCookie() {
+  let token = (process.env.DEEPSEEK_WEB_TOKEN || "").trim();
+  let cookie = (process.env.DEEPSEEK_WEB_COOKIE || "").trim();
+  if (token) return { token, cookie };
+  // 兜底：读本地缓存的 credentials.json（{ "token": "...", "cookie": "..." }）
+  try {
+    const d = JSON.parse(readFileSync(CRED_FILE, "utf-8"));
+    if (d.token) return { token: d.token, cookie: d.cookie || "" };
+  } catch {}
+  return { token: "", cookie: "" };
+}
+
+function authHeaders(token, cookie) {
+  const h = { ...STATIC_HEADERS, Authorization: `Bearer ${token}` };
+  if (cookie) h["Cookie"] = cookie;
+  return h;
+}
+
+// 在嵌套结构里找第一个字符串类型 id
+function deepFindId(d) {
+  if (typeof d === "string") return d;
+  if (Array.isArray(d)) {
+    for (const v of d) {
+      const r = deepFindId(v);
+      if (r) return r;
+    }
+    return null;
+  }
+  if (d && typeof d === "object") {
+    if (typeof d.id === "string") return d.id;
+    for (const k of Object.keys(d)) {
+      const r = deepFindId(d[k]);
+      if (r) return r;
+    }
+  }
+  return null;
+}
+
+async function jsonPost(url, token, cookie, body) {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: authHeaders(token, cookie),
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    throw new Error(`POST ${url} -> ${r.status}: ${txt.slice(0, 300)}`);
+  }
+  return r.json();
+}
+
+async function createPowChallenge(token, cookie) {
+  const j = await jsonPost(API + "/chat/create_pow_challenge", token, cookie, {
+    target_path: "/api/v0/chat/completion",
+  });
+  let node = j?.data ?? {};
+  node = node?.biz_data ?? node;
+  return node?.challenge ?? node;
+}
+
+async function createSession(token, cookie) {
+  const j = await jsonPost(API + "/chat_session/create", token, cookie, { title: "dsh-web" });
+  return deepFindId(j) || j;
+}
+
+/** 流式发消息并解析 SSE，返回 {content, reasoning, respId}。 */
+async function streamMessage(token, cookie, sessionId, prompt, parentId, powHeader, thinking, searchEnabled) {
+  const headers = authHeaders(token, cookie);
+  headers["x-ds-pow-response"] = powHeader;
+  headers["accept"] = "text/event-stream";
+  const payload = {
+    chat_session_id: sessionId,
+    prompt,
+    ref_size: 8,
+    ref_file_ids: [],
+    thinking_enabled: !!thinking,
+    search_enabled: !!searchEnabled,
+    need_depth_search: false,
+    language: "zh-CN",
+  };
+  const pid = parseInt(parentId || 0, 10);
+  if (pid > 0) payload.parent_message_id = pid;
+
+  const resp = await fetch(API + "/chat/completion", {
+    method: "POST",
+    headers,
+    body: JSON.stringify(payload),
+  });
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => "");
+    throw new Error(`POST /chat/completion -> ${resp.status}: ${txt.slice(0, 300)}`);
+  }
+
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  const contentParts = [];
+  const reasoningParts = [];
+  let respId = null;
+  let reqId = null;
+
+  const handleObj = (obj) => {
+    if (typeof obj !== "object" || obj === null) return;
+    if ("response_message_id" in obj && "request_message_id" in obj) {
+      reqId = obj.request_message_id;
+      respId = obj.response_message_id;
+    }
+    const v = obj.v;
+    if (typeof v === "object" && v && typeof v.response === "object") {
+      const r = v.response;
+      if (r.message_id) respId = r.message_id;
+      for (const frag of r.fragments || []) {
+        const fc = frag.content;
+        if (fc == null) continue;
+        if (frag.type === "THINK") reasoningParts.push(fc);
+        else contentParts.push(fc);
+      }
+      return;
+    }
+    if (typeof v === "string" && v !== "FINISHED") {
+      contentParts.push(v);
+      return;
+    }
+    const p = obj.p;
+    const o = obj.o;
+    const val = obj.v;
+    if (p && o && val != null && p.startsWith("response/fragments/")) {
+      const parts = p.split("/");
+      const field = parts[3] || "";
+      if (field === "content") contentParts.push(val);
+      else if (field === "thinking_content") reasoningParts.push(val);
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, i);
+      buf = buf.slice(i + 1);
+      if (!line || line.startsWith("event:")) continue;
+      if (!line.startsWith("data:")) continue;
+      const raw = line.slice(5).trim();
+      if (raw === "[DONE]") continue;
+      try {
+        handleObj(JSON.parse(raw));
+      } catch {
+        /* 非 JSON 行忽略 */
+      }
+    }
+  }
+  if (buf.trim()) {
+    const line = buf.trim();
+    if (line.startsWith("data:")) {
+      const raw = line.slice(5).trim();
+      if (raw && raw !== "[DONE]") {
+        try { handleObj(JSON.parse(raw)); } catch {}
+      }
+    }
+  }
+
+  return { content: contentParts.join(""), reasoning: reasoningParts.join(""), respId };
+}
+
+let _chain = Promise.resolve();
+function serialize(fn) {
+  const r = _chain.then(() => fn());
+  _chain = r.catch(() => {});
+  return r;
+}
+
+/** 发一条消息。conv 为空则新建会话；否则在该会话内续聊（用 conv.parentId 作 parent）。返回 {text, reasoning, respId, sessionId}。 */
+async function askDeepSeek(prompt, model, conv, searchEnabled) {
+  const { token, cookie } = getTokenCookie();
+  if (!token) {
+    throw new Error(
+      "缺少 DeepSeek 网页端 token：请在 <DSH_HOME>/profiles/web/cordis.patch.yml 的 mcp-deepseek-web.env 里填 DEEPSEEK_WEB_TOKEN（网页端 userToken），" +
+      "或把 {\"token\":\"...\",\"cookie\":\"...\"} 写进本包根目录的 credentials.json 作为兜底"
+    );
+  }
+  const thinking = ["reasoner", "r1", "think"].some((k) => String(model || "").toLowerCase().includes(k));
+  let sessionId;
+  let parentId = 0;
+  if (conv && conv.sessionId) {
+    sessionId = conv.sessionId;
+    parentId = parseInt(conv.parentId || 0, 10);
+  } else {
+    const sid = await createSession(token, cookie);
+    sessionId = deepFindId(sid) || sid;
+  }
+  const ch = await createPowChallenge(token, cookie);
+  const powHeader = await makePowHeader(ch);
+  const { content, reasoning, respId } = await streamMessage(token, cookie, sessionId, prompt, parentId, powHeader, thinking, searchEnabled);
+  return { text: content || "", reasoning: reasoning || "", respId, sessionId };
+}
