@@ -1,0 +1,21 @@
+# 依赖与构建产物
+node_modules/
+*.log
+npm-debug.log*
+
+# 运行时数据（登录态/浏览器 profile 绝不能进仓库）
+credentials*.json
+.credentials.yaml
+cache/
+browser_profile/
+browser-data*/
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.tmp
+
+# 本地即时生成物
+docs/
