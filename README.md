@@ -116,12 +116,13 @@ npm install        # 只装 @modelcontextprotocol/sdk
 
 > *凭据取用优先级：`DEEPSEEK_WEB_TOKEN` 环境变量 → `DEEPSEEK_WEB_CREDENTIALS` 指向的文件 → `v1.0/credentials.json`。
 
-**自带 7 个工具**
+**自带 8 个工具**
 
 | 工具 | 说明 |
 |---|---|
 | `web_analyze_range` | 把内容交给网页端模型分析：给 `file` + `start_line`/`end_line` 读文件区间，或直接给 `code`；支持 `summary`/`analyze`/`explain`/`critique`/`implement`、多轮 `conversation_id`、`search=true` 联网、`save_result` 存档 |
 | `critique_workspace` | 对工作区做对抗式审查（挑刺 / 找漏洞） |
+| `deep_simulate` | 「进程模拟推演 + 挑刺」一键工作流：目录树 → `fs_grep` 取证 → 三阶段推演（执行过程 / 可能走向 / 挑刺），支持 `syntax_notes` 提交语法陷阱 |
 | `fs_list` | 列目录（限定在允许根内，防越界） |
 | `fs_read` | 读文件（同上） |
 | `fs_grep` | 内容检索（同上） |
