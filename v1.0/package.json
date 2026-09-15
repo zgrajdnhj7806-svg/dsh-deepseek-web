@@ -1,7 +1,7 @@
 {
   "name": "dsh-mcp-deepseek-web",
   "version": "1.0.1",
-  "description": "DSH 插件（MCP 形态）：把 chat.deepseek.com 网页端接进 DeepSeek Harness —— web_analyze_range（按文件行区间或直喂内容分析 / critique 挑刺 / implement 补全 + 批准后实装 / search 联网 / save_result 存档）、fs_list / fs_read / fs_grep 项目探查、critique_workspace 一键有证据挑刺、web_conversation_list / web_conversation_clear 会话管理。纯 Node 直连网页端，无需 Python 或 HTTP 代理。",
+  "description": "DSH 插件（MCP 形态）：把 chat.deepseek.com 网页端接进 DeepSeek Harness —— web_analyze_range（按文件行区间或直喂内容分析 / critique 挑刺 / implement 补全 + 批准后实装 / search 联网 / save_result 存档）、fs_list / fs_read / fs_grep 项目探查、critique_workspace 一键有证据挑刺、deep_simulate 进程模拟推演+挑刺、web_conversation_list / web_conversation_clear 会话管理。纯 Node 直连网页端，无需 Python 或 HTTP 代理。",
   "type": "module",
   "bin": {
     "deepseek-web-mcp": "src/index.mjs"
