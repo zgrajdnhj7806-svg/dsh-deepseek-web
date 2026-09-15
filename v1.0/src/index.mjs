@@ -32,6 +32,7 @@
  *   - fs_read            读取项目内任意文件/行范围（把真实代码读出来当证据）
  *   - fs_grep            递归搜索符号（确认某符号是否真有消费者/被修改/衰减，消除跨文件假阳性）
  *   - critique_workspace 一键有证据的挑刺：自动 fs_grep→读证据→网页端 critique（手动三步的封装）
+ *   - deep_simulate     「进程模拟推演+挑刺」一键工作流：目录树→grep 取证→SIMULATE_INSTRUCTION 三阶段推演(执行过程/可能走向/挑刺)，支持 syntax_notes(文本模型提交语法陷阱)
  *   - web_conversation_list  列出活跃对话（对话ID/模型/更新时间/预览）
  *   - web_conversation_clear  删除对话（单条 by conversation_id，或 all:true 清空）
  *   所有 fs_* 工具限定在允许根目录内（env DWH_ROOTS 可配多个，逗号/分号分隔；否则 DWH_ROOT；再否则用户主目录），防越界。
@@ -77,7 +78,7 @@ function saveConversations() {
 loadConversations();
 
 const SERVER_NAME = "deepseek-web";
-const SERVER_VERSION = "1.0.0";
+const SERVER_VERSION = "1.0.1";
 
 const BASE = "https://chat.deepseek.com";
 const API = BASE + "/api/v0";
@@ -347,6 +348,12 @@ const TOOLS = [
             required: ["path"],
           },
         },
+        syntax_notes: {
+          type: "string",
+          description:
+            "文本模型（调用方）特别提交的语法 / 特殊说明 —— 把它认为需要网页端重点留意的点（如 GMod Lua 的 C 风格语法、特定 API 陷阱、已知 hack、特殊约定）直接告诉网页端模型。" +
+            "这些说明会被单独标注在证据最前，网页端做推演 / 挑刺时会优先结合。例如「此处用 + 做字符串拼接而非 ..」「该函数每帧调用，注意性能」。",
+        },
         file: { type: "string", description: "要分析的代码文件绝对路径，例如 C:/project/foo.lua。与 code 二选一（code 优先）；都不给则报错。" },
         start_line: { type: "integer", description: "起始行号（1-based，含）；仅在使用 file 时生效" },
         end_line: { type: "integer", description: "结束行号（1-based，含）；仅在使用 file 时生效" },
@@ -492,9 +499,44 @@ const TOOLS = [
         max_evidence: { type: "integer", description: "最多读取多少个命中处作为证据（默认 8，上限 20）", default: 8 },
         window: { type: "integer", description: "每个命中处上下各读多少行上下文（默认 15，即 ±15 行）", default: 15 },
         prompt: { type: "string", description: "针对该符号/主题的具体审查侧重（例如「重点看线程安全与帧率影响」）；省略则做全面挑刺" },
+        syntax_notes: { type: "string", description: "文本模型特别提交的语法/特殊说明（如 GMod Lua C 风格语法、已知 hack、特殊 API 陷阱），会被单独标注在证据最前，网页端挑刺时优先结合。" },
         model: { type: "string", description: "deepseek-chat(普通) 或 deepseek-reasoner(深度思考)", default: "deepseek-reasoner" },
       },
       required: ["target"],
+    },
+  },
+  {
+    name: "deep_simulate",
+    description:
+      "「进程模拟推演 + 挑刺」一键工作流：让 DeepSeek 网页端模型充当资深运行时分析师，对给定入口（符号 / 文件片段 / 整段代码）" +
+      "做一次完整的执行推演，并挑刺。内部自动：①生成「可工作的完整目录树」(buildTree，限定深度与条目上限，跳过噪声目录) 让网页端看到项目结构；" +
+      "②用 fs_grep 搜入口符号的所有定义 / 调用 / 消费处，并各读 ±window 行作为已核实证据(context_files)；" +
+      "③若直接给了 code/file 则作为入口代码；④把「目录树 + 证据 + 文本模型提交的 syntax_notes」一起喂给网页端，" +
+      "执行 SIMULATE_INSTRUCTION：第一阶段逐条推演执行过程(调用链/hook/timer/状态变化/数据流转)，" +
+      "第二阶段预测可能的最终效果与内容走向(正常路径 + 关键分支不同走向 + 崩溃/死循环/性能塌陷等异常路径)，" +
+      "第三阶段结合 syntax_notes 逐条挑刺。返回【目录结构】+【证据摘要】+【模拟推演/可能走向/挑刺】+对话ID(可续聊把答案喂回让网页端评分)。" +
+      "这是「代码取证 + 网页端深度推演 + 挑刺」的整合闭环，比 critique_workspace 更进一步做了「运行时模拟」而非只静态审查。" +
+      "【报告提交给模型处理】返回的【模拟推演/可能走向/挑刺】报告可把全文、你的补充证据或反驳原样作为 question 喂回同一对话ID(conversation_id)，" +
+      "网页端模型据此继续处理/追问/评分——即「把报告提交给模型二次处理」，无需重新开题。其它分析工具(web_analyze_range/critique_workspace)同样支持该续聊机制。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        entry: { type: "string", description: "要模拟推演的入口符号 / 正则（例如 ENT:NPCLoop、NeuralAI.DecideBehavior、EntityFireBullets）。工具会 fs_grep 它在 path 下的所有定义/调用/消费处作为证据。与 code/file 二选一（code/file 优先）。" },
+        path: { type: "string", description: "探索根目录（相对 ROOT，必填！例如 machcout/lua/autorun 或 WorkBuddy/2026-08-20-16-27-02）。用于生成目录树与限定 grep 范围，避免扫整个主目录超时。" },
+        glob: { type: "string", description: "文件名过滤，例如 *.lua（默认按 path 下全部文件 grep）" },
+        code: { type: "string", description: "直接提供入口代码片段（调用方喂的内容优先于 entry）；例如把某个函数的完整实现贴进来让网页端推演它。" },
+        file: { type: "string", description: "入口代码文件绝对路径（与 code 二选一，优先于 entry）" },
+        start_line: { type: "integer", description: "入口文件起始行（1-based，含）；仅在使用 file 时生效" },
+        end_line: { type: "integer", description: "入口文件结束行（1-based，含）；仅在使用 file 时生效" },
+        max_depth: { type: "integer", description: "目录树展开深度（默认 2，上限 5），控制「完整目录」展示多少层", default: 2 },
+        max_evidence: { type: "integer", description: "最多读取多少个 grep 命中处作为证据（默认 10，上限 30）", default: 10 },
+        window: { type: "integer", description: "每个命中处上下各读多少行上下文（默认 20，即 ±20 行）", default: 20 },
+        syntax_notes: { type: "string", description: "文本模型特别提交的语法/特殊说明（如 GMod Lua C 风格语法、已知 hack、特殊 API 陷阱、触发时机说明），会被单独标注在证据最前，网页端推演+挑刺时优先结合。" },
+        model: { type: "string", description: "deepseek-chat(普通) 或 deepseek-reasoner(深度思考，推演推荐)", default: "deepseek-reasoner" },
+        conversation_id: { type: "string", description: "继续已有对话时原样回传上一次返回的对话ID；省略则开新对话。" },
+        restart: { type: "boolean", description: "true=强制开新对话（忽略 conversation_id）", default: false },
+      },
+      required: [],
     },
   },
   {
@@ -547,6 +589,21 @@ const CRITIQUE_INSTRUCTION =
   "③最后给出一组「测验题」：3–6 个尖锐追问，用来考校该方案是否经得起推敲——题目必须命中真实漏洞或可证伪点，不要出表面问题；\n" +
   "④依赖「其它文件是否存在某符号/状态」的判断，按上下文范围警告标注「⚠需跨文件核实」，严禁凭空断言「不存在/未被使用」。";
 
+/** 进程模拟推演 + 挑刺 指令（deep_simulate 专用）：让网页端模型从入口点逐条推演执行、预测走向并挑刺。 */
+const SIMULATE_INSTRUCTION =
+  "请扮演一位资深运行时分析师，对下面的代码 / 模块做「进程模拟推演 + 挑刺」：\n" +
+  "【第一阶段：进程模拟】从入口点（提供的代码 / 符号）出发，逐条推演执行过程：\n" +
+  "  ①按真实控制流还原执行顺序：函数调用链、hook/定时器/timer/回调、循环、条件分支、协程/并行（如适用）；\n" +
+  "  ②标注每个关键节点的状态变化：变量 / 表 / 实体字段 / 全局状态的读写；数据如何在模块 / 文件间流转；\n" +
+  "  ③若入口是函数，明确它的调用方与触发时机（如 Think / NPCLoop / Initialize / 钩子），并模拟一次完整调用周期（含首帧与后续帧的差异）。\n" +
+  "【第二阶段：可能的最终效果与内容走向】\n" +
+  "  ①描述正常路径下的最终效果（对游戏状态 / 输出 / 行为 / 渲染的最终影响）；\n" +
+  "  ②枚举关键分支 / 参数 / 实体状态的不同走向及其触发条件（如不同武器 / 不同 epsilon / 不同实体类型）；\n" +
+  "  ③枚举异常 / 错误路径：崩溃(nil / 越界)、死循环、性能塌陷、状态错乱如何发生、最终表现是什么。\n" +
+  "【第三阶段：挑刺】基于上面模拟，按「问题 → 触发条件 → 后果严重度(高/中/低) → 修复方向」四段逐条列出缺陷；" +
+  "务必重点结合文本模型特别提交的「语法 / 特殊说明」中的点（这些往往是真实陷阱所在）。\n" +
+  "所有结论基于已附上的真实代码证据（目录结构 + 代码片段）；对未在证据中出现的符号，标注「⚠需跨文件核实」，严禁凭空断言存在性。";
+
 /** 无参考上下文时附在主语前的「上下文范围警告」，web_analyze_range / critique_workspace 共用。 */
 const NO_CTX_WARNING =
   "【上下文范围警告】你只看到了下面这段内容，看不到本项目其它文件。因此：\n" +
@@ -560,8 +617,14 @@ const NO_CTX_WARNING =
  * 有该块时不输出旧的【上下文范围警告】，网页端据此作答、不再凭空质疑存在性。
  * 返回空串表示无任何参考上下文。
  */
-function buildContextBlock(contextFiles, context) {
+function buildContextBlock(contextFiles, context, syntaxNotes) {
   const ctxParts = [];
+  if (syntaxNotes && String(syntaxNotes).trim()) {
+    ctxParts.push(
+      "【文本模型特别提交的语法 / 特殊说明 —— 请重点结合这些点做推演与挑刺，不要忽略】\n" +
+      String(syntaxNotes).trim()
+    );
+  }
   if (context && String(context).trim()) ctxParts.push(String(context).trim());
   if (Array.isArray(contextFiles)) {
     for (const cf of contextFiles) {
@@ -593,6 +656,41 @@ function readRange(file, startLine, endLine) {
   const s = Math.max(1, startLine | 0);
   const e = Math.min(lines.length, endLine | 0);
   return { code: lines.slice(s - 1, e).join("\n"), actuallyEnd: e, total: lines.length };
+}
+
+/**
+ * 递归生成目录树字符串（让网页端「看到可工作的完整目录」），带深度与条目上限防止输出爆炸。
+ * 跳过 SKIP_DIRS 噪声目录；文件标注大小（KB/字节）。
+ */
+function buildTree(rootAbs, maxDepth, maxEntries) {
+  const lines = [];
+  let count = 0;
+  const walk = (dir, depth) => {
+    if (depth > maxDepth || count >= maxEntries) return;
+    let names;
+    try { names = readdirSync(dir); } catch { return; }
+    names.sort((a, b) => a.localeCompare(b));
+    for (const name of names) {
+      if (count >= maxEntries) return;
+      const full = join(dir, name);
+      let st;
+      try { st = statSync(full); } catch { continue; }
+      const isDir = st.isDirectory();
+      if (isDir && SKIP_DIRS.has(name)) continue;
+      const indent = "  ".repeat(depth);
+      let size = "";
+      if (!isDir) {
+        size = st.size >= 1024 ? (" (" + (st.size / 1024).toFixed(1) + "KB)") : (" (" + st.size + "B)");
+      }
+      lines.push(indent + (isDir ? "[DIR]  " : "[FILE] ") + name + size);
+      count++;
+      if (isDir) walk(full, depth + 1);
+    }
+  };
+  walk(rootAbs, 0);
+  let out = lines.join("\n");
+  if (count >= maxEntries) out += "\n  …（已达条目上限 " + maxEntries + "，更深层未展开）";
+  return out;
 }
 
 // —— 工作目录访问（技能「挑刺」机制：模型可探查项目、读文件、搜符号，把真实证据交给网页端）——
@@ -834,7 +932,7 @@ async function main() {
           instruction = "请直接总结这段代码的：①核心职责 ②关键逻辑/算法 ③依赖与对外影响（调用了什么、改变了什么状态）。精炼、结论优先，不要发散。";
         }
         // 参考上下文（来自项目真实文件，作为已核实证据，从根上消除跨文件假阳性）
-        const contextBlock = buildContextBlock(a.context_files, a.context);
+        const contextBlock = buildContextBlock(a.context_files, a.context, a.syntax_notes);
         const prompt =
           "你是一名资深代码审查与解释助手，擅长 Lua / GMod Lua / 通用编程语言。用简体中文回答，结论优先，并给出具体修改建议。\n" +
           (contextBlock ? contextBlock : NO_CTX_WARNING) +
@@ -939,7 +1037,7 @@ async function main() {
           const r = readAny(m.file, Math.max(1, m.line - win), m.line + win);
           ctxFiles.push({ path: m.file, start_line: r.start, end_line: r.end });
         }
-        const contextBlock = buildContextBlock(ctxFiles, null);
+        const contextBlock = buildContextBlock(ctxFiles, null, a.syntax_notes);
         const code = "【审查对象（符号 / 主题）】" + a.target +
           (a.prompt && String(a.prompt).trim() ? ("\n【具体审查侧重】" + String(a.prompt).trim()) : "");
         const srcLabel = "审查对象：" + a.target;
@@ -966,6 +1064,113 @@ async function main() {
         if (res.reasoning && requestedModel.includes("reasoner")) out += "【思考过程】\n" + res.reasoning + "\n\n【挑刺结果】\n";
         out += res.text || "";
         out += "\n\n— — —\n对话ID（把答案喂回此 ID 让网页端评分，或继续追问）：" + conv.id;
+        return { content: [{ type: "text", text: out }] };
+      } else if (name === "deep_simulate") {
+        // 「进程模拟推演 + 挑刺」一键工作流：目录树 + 取证 + 模拟指令
+        const a = args || {};
+        if (!a.path || !String(a.path).trim()) {
+          throw new Error("缺少 path（探索根目录，必填！例如 machcout/lua/autorun 或 WorkBuddy/2026-08-20-16-27-02），用于生成目录树与限定 grep 范围，避免扫整个主目录超时");
+        }
+        const hasEntry = a.entry && String(a.entry).trim();
+        const hasCode = a.code != null && String(a.code).trim() !== "";
+        const hasFile = a.file && String(a.file).trim();
+        if (!hasEntry && !hasCode && !hasFile) {
+          throw new Error("缺少入口：请给 entry(符号/正则，配合 path 自动 grep) 或 code(直接贴入口代码) 或 file(入口文件绝对路径)，三者至少给一个");
+        }
+        const maxDepth = Math.max(1, Math.min(parseInt(a.max_depth, 10) || 2, 5));
+        const maxEv = Math.max(1, Math.min(parseInt(a.max_evidence, 10) || 10, 30));
+        const win = Math.max(1, Math.min(parseInt(a.window, 10) || 20, 120));
+
+        // ① 目录树（让网页端看到「可工作的完整目录」）
+        const { abs: treeAbs } = resolveSafe(String(a.path).trim());
+        let treeStat;
+        try { treeStat = statSync(treeAbs); } catch { treeStat = null; }
+        if (!treeStat || !treeStat.isDirectory()) {
+          throw new Error("path 在任一允许根下均不存在或非目录：" + a.path + "（已解析为 " + treeAbs + "；请确认相对 ROOT 的路径正确，例如 WorkBuddy/cn_fly_addon/lua 而非 cn_fly_addon/lua）");
+        }
+        const treeStr = buildTree(treeAbs, maxDepth, 300);
+
+        // ② 入口代码 + 取证（已核实证据）
+        let entryCode = "";
+        const ctxFiles = [];
+        if (hasCode) {
+          entryCode = String(a.code);
+        } else if (hasFile) {
+          const s = parseInt(a.start_line, 10), e = parseInt(a.end_line, 10);
+          if (!(s >= 1) || !(e >= s)) throw new Error("start_line / end_line 非法（需 1-based 且 end>=start）");
+          const rr = readRange(a.file, s, e);
+          if (!rr.code.trim()) throw new Error("指定行范围为空（文件共 " + rr.total + " 行）");
+          entryCode = rr.code;
+          ctxFiles.push({ path: a.file, start_line: rr.start, end_line: rr.end });
+        } else {
+          const grepped = grepProject(String(a.entry), a.path, a.glob, Math.max(maxEv * 4, 40));
+          for (const m of grepped.results) {
+            if (ctxFiles.length >= maxEv) break;
+            const r = readAny(m.file, Math.max(1, m.line - win), m.line + win);
+            ctxFiles.push({ path: m.file, start_line: r.start, end_line: r.end });
+          }
+        }
+        const contextBlock = buildContextBlock(ctxFiles, null, a.syntax_notes);
+        const entryLabel = hasCode
+          ? "入口代码（调用方直接提供）"
+          : hasFile
+            ? ("入口文件：" + a.file + (a.start_line ? " 第 " + a.start_line + "–" + a.end_line + " 行" : ""))
+            : ("入口符号（自动 grep 取证）：" + a.entry);
+
+        const prompt =
+          "你是一名资深运行时分析师，擅长 Lua / GMod Lua / 通用编程语言的执行推演。用简体中文回答，结论优先。\n" +
+          (contextBlock ? contextBlock : NO_CTX_WARNING) +
+          "【可工作的完整目录结构（供你了解工程全貌，路径停留在 " + treeAbs + " 下，深度 " + maxDepth + "）】\n```\n" + treeStr + "\n```\n\n" +
+          entryLabel + "\n\n```\n" + entryCode + "\n```\n\n" + SIMULATE_INSTRUCTION;
+
+        // ③ 多轮对话：定位/新建会话（可把网页端报告喂回此 ID 续聊/评分）
+        const restart = a.restart === true || String(a.restart || "").toLowerCase() === "true";
+        let conv = (!restart && a.conversation_id && conversations.has(a.conversation_id)) ? conversations.get(a.conversation_id) : null;
+        const requestedModel = a.model || "deepseek-reasoner";
+        const effectiveModel = conv ? (conv.model || requestedModel) : requestedModel;
+        const runTurn = () => serialize(() => askDeepSeek(prompt, effectiveModel, conv, false));
+        let res;
+        try {
+          res = await runTurn();
+        } catch (err) {
+          if (conv) { conv = null; res = await runTurn(); }
+          else throw err;
+        }
+        if (!conv) {
+          const newId = randomUUID();
+          conv = { id: newId, sessionId: res.sessionId, parentId: String(res.respId || 0), model: effectiveModel, updated: Date.now(), lastText: res.text || "" };
+          conversations.set(newId, conv);
+        } else {
+          conv.parentId = String(res.respId || 0);
+          conv.sessionId = res.sessionId;
+          conv.updated = Date.now();
+          conv.lastText = res.text || "";
+        }
+        saveConversations();
+
+        // ④ 组装输出
+        let out = "【目录结构】（" + treeAbs + "，深度 " + maxDepth + "，共 " + treeStr.split("\n").length + " 行展示）\n```\n" + treeStr + "\n```\n\n";
+        out += "【证据收集摘要】";
+        if (hasEntry) {
+          out += "grep `" + a.entry + "` 命中 " + ctxFiles.length + " 处作为已核实证据：\n";
+          for (const c of ctxFiles) out += "  • " + c.path + " 第 " + c.start_line + "–" + c.end_line + " 行\n";
+        } else if (hasFile) {
+          out += "入口文件：" + a.file + (a.start_line ? " 第 " + a.start_line + "–" + a.end_line + " 行" : "") + "\n";
+        } else {
+          out += "入口代码由调用方直接提供（" + entryCode.split("\n").length + " 行）\n";
+        }
+        if (res.reasoning && effectiveModel.includes("reasoner")) out += "\n【思考过程】\n" + res.reasoning + "\n\n";
+        out += "【模拟推演 / 可能走向 / 挑刺】\n" + (res.text || "");
+        out += "\n\n— — —\n对话ID（把本报告/反馈喂回此 ID 让网页端评分或继续追问；开新话题则省略或传 restart:true）：" + conv.id;
+        if (a.save_result && String(a.save_result).trim()) {
+          try {
+            const { abs: sp } = resolveSafe(String(a.save_result).trim());
+            writeFileSync(sp, "# DeepSeek 网页端模拟推演存档\n\n" + out + "\n", "utf-8");
+            out = "（已存至 " + sp + "）\n\n" + out;
+          } catch (e) {
+            out = "（save_result 写入失败：" + String((e && e.message) || e) + "）\n\n" + out;
+          }
+        }
         return { content: [{ type: "text", text: out }] };
       } else if (name === "web_conversation_list") {
         const arr = [...conversations.values()].sort((x, y) => (y.updated || 0) - (x.updated || 0));
